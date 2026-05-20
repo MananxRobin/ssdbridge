@@ -1,6 +1,6 @@
 # SSDBridge
 
-**Instant file sharing from your Mac.** Share any folder or drive over LAN or the internet with a single click. No accounts, no uploads, no configuration — just a magic link.
+**Turn any external drive into your personal cloud in seconds.** Plug in a drive, fire up SSDBridge, and share it over LAN or the internet with a single magic link. No uploads, no accounts, no storage limits — your files stay on your drive, accessible from any device, anywhere.
 
 Built with SwiftUI + Vapor on the host side and a vanilla JavaScript SPA for the guest client.
 
