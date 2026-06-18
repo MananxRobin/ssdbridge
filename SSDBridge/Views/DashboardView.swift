@@ -1,6 +1,18 @@
 import SwiftUI
 
 /// Main host dashboard — the primary window of the app.
+extension Color {
+    init(hex: String) {
+        let hex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+        var int: UInt64 = 0
+        Scanner(string: hex).scanHexInt64(&int)
+        let r = Double((int >> 16) & 0xFF) / 255.0
+        let g = Double((int >> 8) & 0xFF) / 255.0
+        let b = Double(int & 0xFF) / 255.0
+        self.init(red: r, green: g, blue: b)
+    }
+}
+
 struct DashboardView: View {
     @EnvironmentObject var appState: AppState
 
@@ -22,6 +34,20 @@ struct DashboardView: View {
                     Label("\(appState.activeLinks.count) Active Links", systemImage: "link")
                     Label("\(appState.activeSessions.count) Sessions", systemImage: "person.2")
                 }
+
+                if appState.isServerRunning && appState.webSocketManager.activeCount > 0 {
+                    Section("Live Presence") {
+                        HStack(spacing: 8) {
+                            Circle()
+                                .fill(.green)
+                                .frame(width: 8, height: 8)
+                            Text("\(appState.webSocketManager.activeCount) guest(s) connected")
+                                .font(.callout)
+                                .foregroundColor(.green)
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
             }
             .listStyle(.sidebar)
             .frame(minWidth: 180)
@@ -30,6 +56,11 @@ struct DashboardView: View {
                 VStack(spacing: 24) {
                     // Server control card
                     serverCard
+
+                    // Live Presence card
+                    if appState.isServerRunning {
+                        presenceCard
+                    }
 
                     // Create Link section
                     CreateLinkView()
@@ -111,6 +142,56 @@ struct DashboardView: View {
             .padding(8)
         } label: {
             Label("Server Control", systemImage: "server.rack")
+        }
+    }
+
+    // MARK: - Presence Card
+
+    @ViewBuilder
+    private var presenceCard: some View {
+        let count = appState.webSocketManager.activeCount
+        let sessions = appState.webSocketManager.activeSessions()
+
+        GroupBox {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 10) {
+                    Circle()
+                        .fill(count > 0 ? Color.green : Color.secondary)
+                        .frame(width: 10, height: 10)
+                    Text(count > 0
+                         ? "\(count) guest(s) connected"
+                         : "No guests connected")
+                        .font(.headline)
+                    Spacer()
+                    if count > 0 {
+                        Text("● LIVE")
+                            .font(.caption)
+                            .foregroundColor(.green)
+                    }
+                }
+
+                if !sessions.isEmpty {
+                    Divider()
+                    ForEach(sessions, id: \.sessionId) { session in
+                        HStack(spacing: 8) {
+                            Circle()
+                                .fill(Color(hex: WebSocketManager.presenceColors[abs(session.sessionId.hashValue) % WebSocketManager.presenceColors.count]))
+                                .frame(width: 8, height: 8)
+                            Text(session.sessionId.prefix(8))
+                                .font(.system(.caption, design: .monospaced))
+                            if !session.path.isEmpty {
+                                Text("→ \(session.path)")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(8)
+        } label: {
+            Label("Live Presence", systemImage: "wave.3.right")
         }
     }
 

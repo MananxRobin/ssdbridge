@@ -118,9 +118,17 @@ const state = {
   sidebarOpen: false,
   filterText: '',
   pagination: { offset: 0, limit: 100, total: 0, hasMore: false },
+  loadingMore: false,
+  sortField: 'name',
+  sortDir: 'asc',
+  lastClickedIndex: null,
   recentFiles: [],
   encrypted: false,
-  encryptionKey: null    // CryptoKey for AES-GCM
+  encryptionKey: null,   // CryptoKey for AES-GCM
+  presence: { count: 0, viewers: [] },
+  activityFeed: [],
+  wormholeActive: false,
+  wormholeFilename: null
 };
 
 // Upload progress tracking
@@ -181,6 +189,15 @@ async function init() {
       if (modal) closeModal();
       const confirmEl = document.querySelector('.confirm-overlay');
       if (confirmEl) confirmEl.remove();
+    }
+    // Backspace or Cmd+ArrowUp = go to parent directory
+    if (state.view === 'browse' && state.currentPath) {
+      const target = e.target;
+      const isInput = target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable;
+      if (!isInput && (e.key === 'Backspace' || (e.metaKey && e.key === 'ArrowUp'))) {
+        e.preventDefault();
+        goUp();
+      }
     }
   });
 
@@ -276,6 +293,20 @@ async function api(method, endpoint, body) {
   return res.json();
 }
 
+function leaveSession() {
+  sessionStorage.removeItem('ssdb_session');
+  state.sessionId = null;
+  state.scopePath = '';
+  state.currentPath = '';
+  state.items = [];
+  state.selectedPaths.clear();
+  state.view = 'join';
+  state.joinError = null;
+  if (ws) { ws.close(); ws = null; }
+  clearTimeout(wsReconnectTimer);
+  render();
+}
+
 async function joinSession(password = null) {
   const token = window.location.pathname.split('/').pop();
   try {
@@ -319,8 +350,23 @@ function connectWebSocket() {
   ws.onmessage = (e) => {
     try {
       const msg = JSON.parse(e.data);
-      if (msg.type === 'refresh') {
-        loadFiles(true); // silent refresh
+      switch (msg.type) {
+        case 'refresh':
+          loadFiles(true); // silent refresh
+          break;
+        case 'presence':
+          state.presence = { count: msg.count || 0, viewers: msg.viewers || [] };
+          render();
+          break;
+        case 'activity':
+          state.activityFeed.unshift(msg);
+          if (state.activityFeed.length > 8) state.activityFeed.pop();
+          showActivityToast(msg);
+          if (msg.action === 'joined' || msg.action === 'left') render();
+          break;
+        case 'beam':
+          handleBeam(msg);
+          break;
       }
     } catch (err) {
       console.error('WS message error:', err);
@@ -356,15 +402,12 @@ async function loadFiles(silent = false, append = false) {
     const p = state.pagination;
     const path = state.currentPath ? `/files/${state.currentPath}` : '/files/';
     const data = await api('GET', `${path}?offset=${p.offset}&limit=${p.limit}`);
-    const newItems = (data.items || []).sort((a, b) => {
-      if (a.type !== b.type) return a.type === 'directory' ? -1 : 1;
-      return a.name.localeCompare(b.name);
-    });
+    const newItems = data.items || [];
     state.items = append ? [...state.items, ...newItems] : newItems;
+    sortItems();
     state.pagination.total = data.totalItems || newItems.length;
     state.pagination.hasMore = data.hasMore || false;
-    // Clear selection on navigation
-    if (!silent) state.selectedPaths.clear();
+    if (!silent) { state.selectedPaths.clear(); state.lastClickedIndex = null; }
   } catch (e) {
     state.error = e.message;
   } finally {
@@ -374,8 +417,42 @@ async function loadFiles(silent = false, append = false) {
 }
 
 function loadMore() {
+  state.loadingMore = true;
+  render();
   state.pagination.offset += state.pagination.limit;
-  loadFiles(true, true);
+  loadFiles(true, true).finally(() => {
+    state.loadingMore = false;
+    render();
+  });
+}
+
+function sortItems() {
+  const { sortField, sortDir } = state;
+  state.items.sort((a, b) => {
+    if (a.type !== b.type) return a.type === 'directory' ? -1 : 1;
+    let cmp = 0;
+    if (sortField === 'name') {
+      cmp = a.name.localeCompare(b.name);
+    } else if (sortField === 'size' && a.type === 'file' && b.type === 'file') {
+      cmp = (a.size || 0) - (b.size || 0);
+    } else if (sortField === 'modified') {
+      cmp = (a.modified || '').localeCompare(b.modified || '');
+    }
+    return sortDir === 'asc' ? cmp : -cmp;
+  });
+  // Reset selection index after sort
+  state.lastClickedIndex = null;
+}
+
+function toggleSort(field) {
+  if (state.sortField === field) {
+    state.sortDir = state.sortDir === 'asc' ? 'desc' : 'asc';
+  } else {
+    state.sortField = field;
+    state.sortDir = 'asc';
+  }
+  sortItems();
+  render();
 }
 
 async function loadRecent() {
@@ -393,12 +470,19 @@ async function loadRecent() {
   }
 }
 
+function sendViewing(path) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'viewing', path: path || state.currentPath || '/' }));
+  }
+}
+
 function navigate(path) {
   state.view = 'browse';
   state.currentPath = path;
   state.pagination.offset = 0;
   state.selectedPaths.clear();
   loadFiles();
+  sendViewing(path || '/');
 }
 
 function goUp() {
@@ -681,6 +765,109 @@ function closeUploadPanel() {
   if (panel) panel.remove();
 }
 
+// ============================================
+//  BEAM (Host → Guest file push)
+// ============================================
+
+async function handleBeam(msg) {
+  const fname = msg.filename || 'a file';
+  const size = msg.size ? formatBytes(msg.size) : '';
+  const ok = await showConfirm(
+    `The host is sending "${fname}"${size ? ' (' + size + ')' : ''} directly to you. Receive it?`,
+    'Incoming Beam'
+  );
+  if (!ok) return;
+
+  try {
+    const url = msg.downloadUrl;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    const blobUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = blobUrl;
+    a.download = fname;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
+    showToast(`"${fname}" received via beam`, 'success', 4000);
+  } catch (e) {
+    showToast('Beam failed: ' + e.message, 'error');
+  }
+}
+
+// ============================================
+//  WORMHOLE (Guest → Host file teleport)
+// ============================================
+
+function triggerWormhole() {
+  state.wormholeActive = true;
+  render();
+  setTimeout(() => {
+    const input = document.getElementById('wormhole-input');
+    if (input) input.click();
+  }, 100);
+}
+
+async function handleWormholeUpload(files) {
+  if (!files.length) { state.wormholeActive = false; render(); return; }
+
+  const file = files[0];
+  state.wormholeFilename = file.name;
+  state.wormholeActive = true;
+  render();
+
+  try {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/wormhole');
+    xhr.setRequestHeader('Authorization', `Bearer ${state.sessionId}`);
+    xhr.setRequestHeader('X-Filename', file.name);
+
+    await new Promise((resolve, reject) => {
+      xhr.onload = () => xhr.status >= 200 && xhr.status < 300 ? resolve() : reject(new Error(`HTTP ${xhr.status}`));
+      xhr.onerror = () => reject(new Error('Network error'));
+      xhr.send(file);
+    });
+
+    state.wormholeActive = false;
+    state.wormholeFilename = null;
+    showToast(`"${file.name}" arrived on host's desktop`, 'success', 4000);
+    render();
+  } catch (e) {
+    state.wormholeActive = false;
+    state.wormholeFilename = null;
+    showToast('Wormhole failed: ' + e.message, 'error');
+    render();
+  }
+}
+
+// ============================================
+//  ACTIVITY TOAST
+// ============================================
+
+function showActivityToast(msg) {
+  const icons = {
+    joined: ICONS.shield,
+    left: '',
+    downloaded: ICONS.download,
+    wormhole: ICONS.upload,
+    beamed: ICONS.upload
+  };
+  const labels = {
+    joined: 'Someone joined the bridge',
+    left: 'Someone left',
+    downloaded: 'Downloaded',
+    wormhole: 'Sent via wormhole',
+    beamed: 'Beamed'
+  };
+  const icon = icons[msg.action] || '';
+  const label = labels[msg.action] || msg.action;
+  const detail = msg.detail ? ` ${escHtml(msg.detail)}` : '';
+  const text = `${label}${detail}`;
+  showToast(`${icon} ${text}`, msg.action === 'left' ? 'warning' : 'success', 3000);
+}
+
 function cancelTransfer(index) {
   const entry = uploads.active[index];
   if (!entry) return;
@@ -759,8 +946,9 @@ async function createFolder() {
   }
 }
 
-async function confirmDelete(path) {
-  const ok = await showConfirm('This action cannot be undone.', 'Delete item?', true);
+async function confirmDelete(path, fileName) {
+  const name = fileName || path.split('/').pop();
+  const ok = await showConfirm(`"${name}" will be permanently deleted. This cannot be undone.`, `Delete "${name}"?`, true);
   if (ok) {
     try { await api('DELETE', `/delete/${path}`); loadFiles(); }
     catch (e) { showToast('Delete failed: ' + e.message, 'error'); }
@@ -780,12 +968,28 @@ async function renameItem(pathEncoded, nameEncoded) {
 //  MULTI-SELECT & BULK DOWNLOAD
 // ============================================
 
-function toggleSelect(path, event) {
+function toggleSelect(path, event, fileIndex) {
   event.stopPropagation();
-  if (state.selectedPaths.has(path)) {
-    state.selectedPaths.delete(path);
+  const fileItems = state.items.filter(i => i.type === 'file');
+
+  if (event.shiftKey && state.lastClickedIndex !== null && fileIndex !== undefined) {
+    const start = Math.min(state.lastClickedIndex, fileIndex);
+    const end = Math.max(state.lastClickedIndex, fileIndex);
+    const adding = !state.selectedPaths.has(path);
+    for (let i = start; i <= end; i++) {
+      if (fileItems[i]) {
+        if (adding) state.selectedPaths.add(fileItems[i].path);
+        else state.selectedPaths.delete(fileItems[i].path);
+      }
+    }
+    state.lastClickedIndex = fileIndex;
   } else {
-    state.selectedPaths.add(path);
+    if (state.selectedPaths.has(path)) {
+      state.selectedPaths.delete(path);
+    } else {
+      state.selectedPaths.add(path);
+    }
+    state.lastClickedIndex = fileIndex !== undefined ? fileIndex : null;
   }
   render();
 }
@@ -1107,10 +1311,9 @@ async function downloadEncrypted(item) {
     } catch (decryptErr) {
       // Decryption failed — file may have been uploaded before key was ready
       console.warn('Decryption failed, offering fallback:', decryptErr.message);
-      const fallback = confirm(
-        `Decryption failed for "${item.name}".\n\n` +
-        `This file may have been uploaded without encryption (before the key was active).\n\n` +
-        `Download the raw file instead?`
+      const fallback = await showConfirm(
+        `Decryption failed for "${item.name}". This file may have been uploaded without encryption. Download the raw file instead?`,
+        'Decryption failed'
       );
       if (!fallback) return;
       // Offer raw bytes as-is
@@ -1204,7 +1407,7 @@ async function previewFile(item) {
       const data = await res.json();
       if (data.type === 'text' && data.content) {
         const escaped = data.content.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-        document.querySelector('.modal-content').innerHTML = `<pre style="font-family:'SF Mono',Menlo,monospace;font-size:13px;line-height:1.6;color:#334155;padding:24px;margin:0;white-space:pre-wrap;word-break:break-word;text-align:left;width:100%;max-height:80vh;overflow:auto;background:#f8fafc">${escaped}</pre>`;
+        document.querySelector('.modal-content').innerHTML = `<pre style="font-family:'IBM Plex Mono','SF Mono',Menlo,monospace;font-size:13px;line-height:1.6;color:#334155;padding:24px;margin:0;white-space:pre-wrap;word-break:break-word;text-align:left;width:100%;max-height:80vh;overflow:auto;background:#f8fafc">${escaped}</pre>`;
       } else {
         document.querySelector('.modal-content').innerHTML = `<div style="padding:40px;text-align:center;color:#64748b">Preview not available.</div>`;
       }
@@ -1253,8 +1456,8 @@ function downloadItemEncoded(path, type, size) {
   downloadItem({ path: decodedPath, type, name, size: size != null ? Number(size) : undefined });
 }
 
-function deleteItemEncoded(path) {
-  confirmDelete(decodeURIComponent(path));
+function deleteItemEncoded(path, nameEncoded) {
+  confirmDelete(decodeURIComponent(path), decodeURIComponent(nameEncoded || ''));
 }
 
 // ============================================
@@ -1368,7 +1571,7 @@ function renderRecentView(app) {
     const time = f.time ? new Date(f.time).toLocaleString() : '—';
     return `<tr onclick="navigateToRecentFile('${escHtml(f.file)}')" tabindex="0" role="row" onkeydown="if(event.key==='Enter') navigateToRecentFile('${escHtml(f.file)}')">
       <td role="gridcell"><div class="file-name"><span class="file-icon ${colorClass}">${icon}</span><span class="file-name-text">${escHtml(f.file)}</span></div></td>
-      <td role="gridcell"><span style="font-size:12px;color:${f.action === 'upload' ? '#a855f7' : '#3b82f6'}">${f.action === 'upload' ? ICONS.upload : ICONS.download} ${f.action}</span></td>
+      <td role="gridcell"><span style="font-size:12px;color:${f.action === 'upload' ? 'var(--color-brand)' : 'var(--color-info)'}">${f.action === 'upload' ? ICONS.upload : ICONS.download} ${f.action}</span></td>
       <td role="gridcell" style="font-size:12px;color:var(--color-text-tertiary)">${time}</td>
       <td role="gridcell" style="text-align:right"><button class="btn btn-secondary" onclick="event.stopPropagation(); downloadItemEncoded('${encodeURIComponent(f.file)}', 'file', 0)">${ICONS.download}</button></td>
     </tr>`;
@@ -1382,6 +1585,7 @@ function renderRecentView(app) {
       <button class="nav-item active" onclick="loadRecent(); closeSidebar();">${ICONS.search}<span>Recent</span></button>
       <div class="sidebar-spacer"></div>
       <button class="nav-item theme-toggle-item" onclick="toggleTheme()"><span class="nav-icon-placeholder">${ICONS.moon}</span><span>Toggle theme</span></button>
+      <button class="nav-item leave-item" onclick="leaveSession()"><span class="nav-icon-placeholder">${ICONS.lock}</span><span>Leave session</span></button>
     </aside>
     <main class="main">
       <header class="header">
@@ -1485,9 +1689,10 @@ function renderJoinView(app) {
     <div class="join-page">
       <section class="hero-panel">
         <p class="eyebrow">SSDBridge</p>
-        <h1>Secure, instant file sharing</h1>
+        <h1>Secure File<br>Bridge</h1>
+	        <p class="hero-subtitle">// encrypted &middot; peer-to-peer &middot; zero-knowledge</p>
         <p class="hero-copy">
-          Access shared files from any device with a simple link. Fast, secure, and effortless.
+          Access shared files directly from any device. No cloud storage. No intermediaries. Your files, your infrastructure.
         </p>
         <div class="hero-features">
           <div class="feature-item">
@@ -1496,18 +1701,18 @@ function renderJoinView(app) {
           </div>
           <div class="feature-item">
             <span class="feature-icon">${ICONS.upload}</span>
-            <span>Upload and download with ease</span>
+            <span>End-to-end encryption</span>
           </div>
           <div class="feature-item">
             <span class="feature-icon">${ICONS.folder}</span>
-            <span>Browse folders in real time</span>
+            <span>Browse and transfer in real time</span>
           </div>
         </div>
       </section>
 
       <section class="join-card">
         <div class="join-card-icon">${ICONS.lock}</div>
-        <h2>Access shared files</h2>
+        <h2>Access</h2>
         <p>Enter the password provided by the host to continue.</p>
         ${encBadge}
 
@@ -1539,6 +1744,7 @@ function renderTableRows(canWrite) {
   const fileItems = visibleItems.filter(i => i.type === 'file');
   const allSelected = fileItems.length > 0 && state.selectedPaths.size === fileItems.length;
 
+  let fileIdx = 0;
   return visibleItems.map((item) => {
     const { icon, colorClass } = getIcon(item.name, item.type);
     const size = item.sizeFormatted || '—';
@@ -1547,18 +1753,23 @@ function renderTableRows(canWrite) {
     const nameEncoded = encode(item.name);
     const isSelected = state.selectedPaths.has(item.path);
     const isFile = item.type === 'file';
+    const currentFileIdx = isFile ? fileIdx++ : -1;
+    // Presence dot — someone else is viewing this file/folder
+    const viewer = state.presence.viewers.find(v => v.path === item.path);
+    const presenceDot = viewer ? `<span class="presence-file-dot" style="background:${viewer.color}" title="Someone is viewing this"></span>` : '';
 
     return `
       <tr class="${isSelected ? 'row-selected' : ''}" tabindex="0" role="row" aria-selected="${isSelected}"
           onclick="openItemEncoded('${pathEncoded}', '${nameEncoded}', '${item.type}')"
           onkeydown="if(event.key==='Enter') openItemEncoded('${pathEncoded}', '${nameEncoded}', '${item.type}')">
         <td class="td-checkbox" role="gridcell" onclick="event.stopPropagation()">
-          ${isFile ? `<input type="checkbox" ${isSelected ? 'checked' : ''} onchange="toggleSelect(decodeURIComponent('${pathEncoded}'), event)" aria-label="Select ${item.name}">` : ''}
+          ${isFile ? `<input type="checkbox" ${isSelected ? 'checked' : ''} onchange="toggleSelect(decodeURIComponent('${pathEncoded}'), event, ${currentFileIdx})" aria-label="Select ${item.name}">` : ''}
         </td>
         <td role="gridcell">
           <div class="file-name">
             <span class="file-icon ${colorClass}">${icon}</span>
             <span class="file-name-text">${item.name}</span>
+            ${presenceDot}
           </div>
         </td>
         <td role="gridcell">${size}</td>
@@ -1567,7 +1778,7 @@ function renderTableRows(canWrite) {
            <div class="row-actions">
              <button class="btn btn-icon btn-ghost" title="Download" aria-label="Download ${item.name}" onclick="event.stopPropagation(); downloadItemEncoded('${pathEncoded}', '${item.type}', ${item.size || 0})">${ICONS.download}</button>
              ${canWrite ? `<button class="btn btn-icon btn-ghost" title="Rename" aria-label="Rename ${item.name}" onclick="event.stopPropagation(); renameItem('${pathEncoded}', '${nameEncoded}')">${ICONS.rename}</button>` : ''}
-             ${canWrite ? `<button class="btn btn-icon btn-ghost danger" title="Delete" aria-label="Delete ${item.name}" onclick="event.stopPropagation(); deleteItemEncoded('${pathEncoded}')">${ICONS.trash}</button>` : ''}
+             ${canWrite ? `<button class="btn btn-icon btn-ghost danger" title="Delete" aria-label="Delete ${item.name}" onclick="event.stopPropagation(); deleteItemEncoded('${pathEncoded}','${nameEncoded}')">${ICONS.trash}</button>` : ''}
            </div>
         </td>
       </tr>
@@ -1627,6 +1838,12 @@ function buildBrowseShell(canWrite, bcHtml, itemCount, bodyContent, isSkeleton) 
   const fileItems = state.items.filter(i => i.type === 'file');
   const allSelected = fileItems.length > 0 && state.selectedPaths.size === fileItems.length;
 
+  // Sort arrow helper
+  const sortArrow = (field) => {
+    const active = state.sortField === field;
+    return `<span class="sort-arrow${active ? ' active' : ''}">${active ? (state.sortDir === 'asc' ? ' ▲' : ' ▼') : ' ⇅'}</span>`;
+  };
+
   return `
     <div class="app-shell">
       <div class="sidebar-overlay" id="sidebar-overlay" onclick="closeSidebar()"></div>
@@ -1653,10 +1870,10 @@ function buildBrowseShell(canWrite, bcHtml, itemCount, bodyContent, isSkeleton) 
 
         <div class="sidebar-section">
           <p class="sidebar-label">Share</p>
-          <div style="background:white;padding:6px;border-radius:6px;display:inline-block;margin:4px 0">
+          <div style="background:rgba(255,255,255,0.06);padding:6px;border-radius:3px;display:inline-block;margin:4px 0">
             ${generateQRSVG(window.location.origin + window.location.pathname, 120)}
           </div>
-          <p style="color:#94a3b8;font-size:10px;text-align:center;margin-top:2px">Scan to join</p>
+          <p style="color:#706860;font-size:9px;font-family:'IBM Plex Mono',monospace;text-align:center;margin-top:2px;letter-spacing:0.04em">SCAN TO JOIN</p>
         </div>
 
         <div class="sidebar-spacer"></div>
@@ -1664,6 +1881,11 @@ function buildBrowseShell(canWrite, bcHtml, itemCount, bodyContent, isSkeleton) 
         <button class="nav-item theme-toggle-item" onclick="toggleTheme()" aria-label="Toggle dark mode">
           <span class="nav-icon-placeholder">${ICONS.moon}</span>
           <span>Toggle theme</span>
+        </button>
+
+        <button class="nav-item leave-item" onclick="leaveSession()" aria-label="Leave session">
+          <span class="nav-icon-placeholder">${ICONS.lock}</span>
+          <span>Leave session</span>
         </button>
 
         ${canWrite ? `
@@ -1687,8 +1909,16 @@ function buildBrowseShell(canWrite, bcHtml, itemCount, bodyContent, isSkeleton) 
             </div>
           </div>
           <div class="header-tools">
+            ${state.presence.count > 1 ? `
+            <div class="presence-badge" title="${state.presence.count - 1} other(s) browsing">
+              <span class="presence-dot-live"></span>
+              <span>${state.presence.count - 1} here</span>
+            </div>
+            ` : ''}
             ${encBanner}
+            <button class="btn btn-secondary" onclick="triggerWormhole()" title="Wormhole — send a file to the host">${ICONS.upload}<span style="font-size:10px;margin-left:2px;opacity:0.7">⚡</span></button>
             <button class="btn btn-secondary" onclick="goUp()" ${!state.currentPath ? 'disabled' : ''}>${ICONS.chevronRight} Back</button>
+            <input type="file" id="wormhole-input" style="display:none" onchange="handleWormholeUpload(this.files); this.value='';">
           </div>
         </header>
 
@@ -1698,6 +1928,12 @@ function buildBrowseShell(canWrite, bcHtml, itemCount, bodyContent, isSkeleton) 
             oninput="debounceFilter(this.value)">
           ${state.filterText ? `<button class="btn btn-ghost" onclick="state.filterText=''; render();">Clear</button>` : ''}
         </div>
+        ${state.filterText && state.pagination.hasMore ? `
+        <div class="search-scope-note">
+          ${ICONS.search} Showing matches from first ${state.items.length} of ${state.pagination.total} items.
+          <button class="btn btn-ghost" style="font-size:11px;min-height:24px;padding:0 8px" onclick="loadMore()">Search more</button>
+        </div>
+        ` : ''}
 
         <section class="content-card">
           <div class="card-header">
@@ -1719,9 +1955,9 @@ function buildBrowseShell(canWrite, bcHtml, itemCount, bodyContent, isSkeleton) 
               <thead role="rowgroup">
                 <tr role="row">
                   <th class="th-checkbox"><input type="checkbox" ${allSelected ? 'checked' : ''} onchange="toggleSelectAll()"></th>
-                  <th style="width:40%">Name</th>
-                  <th style="width:12%">Size</th>
-                  <th style="width:25%" class="th-modified">Modified</th>
+                  <th class="sortable" style="width:40%" onclick="toggleSort('name')">Name${sortArrow('name')}</th>
+                  <th class="sortable" style="width:12%" onclick="toggleSort('size')">Size${sortArrow('size')}</th>
+                  <th class="sortable th-modified" style="width:25%" onclick="toggleSort('modified')">Modified${sortArrow('modified')}</th>
                   <th style="width:13%;text-align:right">Actions</th>
                 </tr>
               </thead>
@@ -1730,7 +1966,9 @@ function buildBrowseShell(canWrite, bcHtml, itemCount, bodyContent, isSkeleton) 
           </div>`}
           ${state.pagination.hasMore && !isSkeleton ? `
             <div style="text-align:center;padding:12px 0;">
-              <button class="btn btn-secondary" onclick="loadMore()">Load more…</button>
+              <button class="btn btn-secondary" onclick="loadMore()" ${state.loadingMore ? 'disabled' : ''}>
+                ${state.loadingMore ? 'Loading…' : 'Load more…'}
+              </button>
             </div>
           ` : ''}
         </section>
@@ -1740,7 +1978,7 @@ function buildBrowseShell(canWrite, bcHtml, itemCount, bodyContent, isSkeleton) 
 
       <div class="mobile-bottom-bar">
         <button class="bottom-bar-btn" onclick="navigate('')">${ICONS.home}<span>Files</span></button>
-        <button class="bottom-bar-btn" onclick="triggerUpload()">${ICONS.upload}<span>Upload</span></button>
+        ${canWrite ? `<button class="bottom-bar-btn" onclick="triggerUpload()">${ICONS.upload}<span>Upload</span></button>` : ''}
         <button class="bottom-bar-btn" onclick="document.querySelector('.search-input')?.focus()">${ICONS.search}<span>Search</span></button>
         <button class="bottom-bar-btn" onclick="toggleSidebar()">${ICONS.menu}<span>Menu</span></button>
       </div>
@@ -1748,6 +1986,23 @@ function buildBrowseShell(canWrite, bcHtml, itemCount, bodyContent, isSkeleton) 
 
     <div id="modal-container"></div>
     <div class="drop-zone" id="drop-zone">Drop files to upload</div>
+    ${state.wormholeActive ? `
+    <div class="wormhole-overlay" onclick="state.wormholeActive=false;state.wormholeFilename=null;render()">
+      <div class="wormhole-portal" onclick="event.stopPropagation()">
+        <div class="wormhole-ring"></div>
+        <div class="wormhole-ring wormhole-ring-2"></div>
+        <div class="wormhole-ring wormhole-ring-3"></div>
+        <div class="wormhole-core">
+          ${ICONS.upload}
+          <p class="wormhole-label">${state.wormholeFilename ? `Sending "${escHtml(state.wormholeFilename)}"…` : 'Wormhole Active'}</p>
+          <p class="wormhole-sub">${state.wormholeFilename ? 'Materializing on host…' : 'Drop any file to teleport it to the host'}</p>
+          ${state.wormholeFilename ? '<div class="wormhole-spinner"></div>' : `
+          <button class="btn btn-primary" onclick="triggerWormhole()" style="margin-top:12px">Choose file</button>
+          `}
+        </div>
+      </div>
+    </div>
+    ` : ''}
   `;
 }
 

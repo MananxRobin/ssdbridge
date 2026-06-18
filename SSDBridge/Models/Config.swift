@@ -10,4 +10,9 @@ struct Config {
     static let sessionCleanupInterval: TimeInterval = 60
     static let maxPreviewBytes = 512 * 1024 // 512 KB for text previews
     static let corsOrigins = ["*"]
+    static let presenceBroadcastInterval: TimeInterval = 2.0
+    static let wormholeInboxDir: String = {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return (home as NSString).appendingPathComponent("SSDBridge Inbox")
+    }()
 }

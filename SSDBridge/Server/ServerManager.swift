@@ -69,6 +69,8 @@ final class ServerManager: @unchecked Sendable {
         registerWebSocketRoute(app: app)
         registerBulkDownloadRoute(app: app, auth: auth, rateLimit: fileRateLimit)
         registerStatsRoute(app: app)
+        registerWormholeRoute(app: app, auth: auth)
+        registerHostBeamRoute(app: app, auth: auth)
         registerRecentRoute(app: app, auth: auth)
         registerHealthRoute(app: app)
         registerStaticFiles(app: app)
@@ -129,11 +131,11 @@ final class ServerManager: @unchecked Sendable {
         app.webSocket("ws") { req, ws in
             // Authenticate via query param
             guard let sessionId = req.query[String.self, at: "token"],
-                  self.sessionManager.getSession(sessionId) != nil else {
+                  let session = self.sessionManager.getSession(sessionId) else {
                 try? await ws.close()
                 return
             }
-            self.webSocketManager.add(sessionId: sessionId, socket: ws)
+            self.webSocketManager.add(sessionId: sessionId, socket: ws, scopePath: session.scopePath)
         }
     }
 
@@ -349,6 +351,80 @@ final class ServerManager: @unchecked Sendable {
         }
     }
 
+    // MARK: - Wormhole Route (guest → host file transfer)
+
+    private func registerWormholeRoute(app: Application, auth: AuthMiddleware) {
+        app.grouped(auth).on(.POST, "api", "wormhole", body: .collect(maxSize: "100mb")) { req -> Response in
+            let session = try req.userSession
+            let fm = FileManager.default
+
+            // Parse multipart or raw body
+            var results: [[String: Any]] = []
+
+            if let body = req.body.data {
+                let rawFilename = req.headers.first(name: "X-Filename") ?? "wormhole_file"
+                let safeFilename = (rawFilename as NSString).lastPathComponent
+                let destPath = (Config.wormholeInboxDir as NSString).appendingPathComponent(safeFilename)
+                // Avoid overwriting — append number if needed
+                let finalPath = self.uniquePath(for: destPath)
+                try Data(buffer: body).write(to: URL(fileURLWithPath: finalPath))
+                results.append(["name": safeFilename, "size": body.readableBytes, "status": "arrived"])
+            }
+
+            if let contentType = req.headers.contentType,
+               contentType.type == "multipart" {
+                let files = try req.content.decode([String: [File]].self)
+                for (_, fileList) in files {
+                    for file in fileList {
+                        let safeName = (file.filename as NSString).lastPathComponent
+                        let destPath = (Config.wormholeInboxDir as NSString).appendingPathComponent(safeName)
+                        let finalPath = self.uniquePath(for: destPath)
+                        try Data(buffer: file.data).write(to: URL(fileURLWithPath: finalPath))
+                        results.append(["name": safeName, "size": file.data.readableBytes, "status": "arrived"])
+                    }
+                }
+            }
+
+            let totalBytes = results.reduce(Int64(0)) { $0 + (($1["size"] as? Int64) ?? Int64($1["size"] as? Int ?? 0)) }
+            self.transferStats.recordUpload(bytes: totalBytes)
+
+            // Broadcast activity
+            for file in results {
+                if let name = file["name"] as? String {
+                    self.webSocketManager.broadcastActivity(action: "wormhole", detail: name)
+                }
+            }
+
+            // Notify host
+            let fileNames = results.compactMap { $0["name"] as? String }.joined(separator: ", ")
+            self.onNotification?("Wormhole: file arrived", fileNames)
+
+            let responseData: [String: Any] = ["arrived": true, "files": results]
+            let jsonData = try JSONSerialization.data(withJSONObject: responseData)
+            let response = Response(status: .ok)
+            response.headers.contentType = .json
+            response.body = .init(data: jsonData)
+            return response
+        }
+    }
+
+    /// Avoid overwriting existing files by appending a number.
+    private func uniquePath(for path: String) -> String {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: path) else { return path }
+        let dir = (path as NSString).deletingLastPathComponent
+        let base = (path as NSString).lastPathComponent
+        let stem = (base as NSString).deletingPathExtension
+        let ext = (base as NSString).pathExtension
+        for i in 1...999 {
+            let candidate = ext.isEmpty
+                ? (dir as NSString).appendingPathComponent("\(stem) \(i)")
+                : (dir as NSString).appendingPathComponent("\(stem) \(i).\(ext)")
+            if !fm.fileExists(atPath: candidate) { return candidate }
+        }
+        return path
+    }
+
     // MARK: - Stats Route
 
     private func registerStatsRoute(app: Application) {
@@ -361,6 +437,50 @@ final class ServerManager: @unchecked Sendable {
                 "activeWebSockets": self.webSocketManager.activeCount,
             ]
             let jsonData = try JSONSerialization.data(withJSONObject: data)
+            let response = Response(status: .ok)
+            response.headers.contentType = .json
+            response.body = .init(data: jsonData)
+            return response
+        }
+    }
+
+    // MARK: - Host Beam Route
+
+    private func registerHostBeamRoute(app: Application, auth: AuthMiddleware) {
+        app.grouped(auth).post("api", "host", "beam") { req -> Response in
+            struct BeamBody: Content { var path: String }
+            let body = try req.content.decode(BeamBody.self)
+            let session = try req.userSession
+
+            let filePath = (session.scopePath as NSString).appendingPathComponent(body.path)
+            let resolved = (filePath as NSString).standardizingPath
+            let scope = (session.scopePath as NSString).standardizingPath
+            guard resolved.hasPrefix(scope) else {
+                throw Abort(.forbidden, reason: "Access denied — path outside scope")
+            }
+            guard FileManager.default.fileExists(atPath: resolved) else {
+                throw Abort(.notFound, reason: "File not found")
+            }
+            guard !self.isSymbolicLink(atPath: resolved) else {
+                throw Abort(.forbidden, reason: "Symbolic links are not followed")
+            }
+
+            let filename = (resolved as NSString).lastPathComponent
+            let attrs = try FileManager.default.attributesOfItem(atPath: resolved)
+            let size = (attrs[.size] as? Int64) ?? 0
+
+            // Build per-session download URLs
+            let encodedPath = body.path.split(separator: "/").map { $0.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? String($0) }.joined(separator: "/")
+            var downloadUrls: [String: String] = [:]
+            for sid in self.webSocketManager.connectedSessionIds() {
+                downloadUrls[sid] = "/api/download/\(encodedPath)?token=\(sid)"
+            }
+
+            self.webSocketManager.beamToAll(filename: filename, size: size, downloadUrls: downloadUrls)
+            self.accessLogger.log(ip: "host", action: .download, tokenId: session.token, detail: "Beam: \(filename)")
+
+            let responseData: [String: Any] = ["beamed": filename, "recipients": downloadUrls.count]
+            let jsonData = try JSONSerialization.data(withJSONObject: responseData)
             let response = Response(status: .ok)
             response.headers.contentType = .json
             response.body = .init(data: jsonData)
@@ -556,6 +676,8 @@ final class ServerManager: @unchecked Sendable {
 
             self.accessLogger.log(ip: ip, action: .joinSuccess, tokenId: tokenId, detail: "Scope: \(tokenData.scopePath)")
             self.onNotification?("Someone joined", "IP: \(ip) — \(tokenData.scopePath)")
+            // Will broadcast activity once WebSocket connects — just store intent
+            // Activity is broadcast from WebSocketManager.add()
 
             let data: [String: String] = [
                 "sessionId": session.id,
@@ -767,6 +889,7 @@ final class ServerManager: @unchecked Sendable {
             }
             self.onNotification?("File downloaded", fileName)
             self.accessLogger.log(ip: self.extractClientIP(from: req), action: .download, tokenId: session.token, detail: fileName)
+            self.webSocketManager.broadcastActivity(action: "downloaded", detail: fileName)
 
             return response
         }
